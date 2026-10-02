@@ -5661,7 +5661,7 @@
       "input_schema": {
         "properties": {
           "categories": {
-            "description": "Filter by v2 system-log categories (for example ['SECURITY', 'UNIFI_DEVICES']). Ignored on legacy controllers",
+            "description": "Filter by v2 system-log categories (for example ['SECURITY', 'UNIFI_DEVICES']). 'AUDIT' returns admin activity (configuration changes, admin logins) and is not in the default set. Ignored on legacy controllers",
             "type": "array"
           },
           "event_type": {
