@@ -44,7 +44,9 @@ async def test_client_device_failure_translation_is_safe(method: str, caplog: py
     manager = SwitchManager(connection) if method == "_get_device_stat" else StatsManager(connection, MagicMock())
     with caplog.at_level(logging.DEBUG), pytest.raises(RequestError) as caught:
         await getattr(manager, method)(MAC)
-    connection.request.assert_awaited_once()
+    # DPI tries the v2 aggregate before the legacy endpoint, so it may await twice;
+    # what matters here is that no attempt leaks the MAC or controller text.
+    connection.request.assert_awaited()
     rendered = "".join(traceback.format_exception(caught.value))
     assert "RuntimeError" in str(caught.value)
     assert caught.value.__suppress_context__ is True

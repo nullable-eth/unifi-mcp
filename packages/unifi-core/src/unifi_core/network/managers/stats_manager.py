@@ -55,6 +55,68 @@ def _resolve_granularity(granularity: str) -> str:
     return granularity
 
 
+# Report retention on current controllers: 5-minute rows for ~12-24h, hourly
+# for ~7d, daily for ~1y. Auto-selection stays inside the shortest of each.
+_AUTO_5MIN_MAX_AGE_MS = 12 * 3600 * 1000
+_AUTO_HOURLY_MAX_AGE_MS = 7 * 24 * 3600 * 1000
+
+
+def _window_ms(
+    duration_hours: int,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+) -> tuple[int, int]:
+    """Resolve a report window in epoch milliseconds.
+
+    An explicit ``start_ms`` wins over ``duration_hours``; ``end_ms`` defaults
+    to now. Raises ValueError for an empty or inverted window.
+    """
+    now_ms = int(datetime.now().timestamp() * 1000)
+    end = int(end_ms) if end_ms is not None else now_ms
+    start = int(start_ms) if start_ms is not None else end - int(duration_hours) * 3600 * 1000
+    if start >= end:
+        raise ValueError("Report window start must be before its end.")
+    return start, end
+
+
+def _auto_granularity(start_ms: int) -> str:
+    """Pick the finest report granularity the controller still retains for start_ms."""
+    age = int(datetime.now().timestamp() * 1000) - start_ms
+    if age <= _AUTO_5MIN_MAX_AGE_MS:
+        return "5minutes"
+    if age <= _AUTO_HOURLY_MAX_AGE_MS:
+        return "hourly"
+    return "daily"
+
+
+def _v2_traffic_payload(response: Any) -> Dict[str, Any]:
+    """Unwrap the v2 /traffic response, which arrives as a dict or a one-element list."""
+    if isinstance(response, list) and response and isinstance(response[0], dict):
+        response = response[0]
+    return response if isinstance(response, dict) else {}
+
+
+def _group_dpi_usage(entries: List[Dict[str, Any]], by: str) -> List[Dict[str, Any]]:
+    """Normalise v2 usage rows and optionally fold them into categories, largest first."""
+    if by == "by_cat":
+        folded: Dict[Any, Dict[str, Any]] = {}
+        for e in entries:
+            cat = e.get("category")
+            row = folded.setdefault(
+                cat, {"category": cat, "bytes_transmitted": 0, "bytes_received": 0, "total_bytes": 0}
+            )
+            for k in ("bytes_transmitted", "bytes_received", "total_bytes"):
+                row[k] += int(e.get(k) or 0)
+        rows = list(folded.values())
+    else:
+        rows = [dict(e) for e in entries]
+    for row in rows:
+        # v2 counts from the client's side: transmitted = uploaded by the client.
+        row["upload_bytes"] = int(row.get("bytes_transmitted") or 0)
+        row["download_bytes"] = int(row.get("bytes_received") or 0)
+    return sorted(rows, key=lambda r: int(r.get("total_bytes") or 0), reverse=True)
+
+
 class StatsManager:
     """Manages statistics retrieval from the Unifi Controller."""
 
@@ -108,20 +170,28 @@ class StatsManager:
             raise
 
     async def get_client_stats(
-        self, client_mac: str, duration_hours: int = 1, granularity: str = "hourly"
+        self,
+        client_mac: str,
+        duration_hours: int = 1,
+        granularity: str = "hourly",
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Get statistics for a specific client."""
+        """Get statistics for a specific client.
+
+        ``start_ms``/``end_ms`` select an absolute window (epoch ms) and take
+        precedence over ``duration_hours``, which otherwise counts back from now.
+        """
         client_mac = normalize_mac(client_mac) or client_mac
         granularity = _resolve_granularity(granularity)
-        cache_key = f"{CACHE_PREFIX_STATS_CLIENT}_{client_mac}_{duration_hours}_{granularity}_{self._connection.site}"
+        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
+        window_key = f"{start_ms}_{end_ms}" if start_ms is not None or end_ms is not None else str(duration_hours)
+        cache_key = f"{CACHE_PREFIX_STATS_CLIENT}_{client_mac}_{window_key}_{granularity}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=300)  # 5 minute cache
         if cached_data is not None:
             return cached_data
 
         try:
-            start_time = int((datetime.now() - timedelta(hours=duration_hours)).timestamp() * 1000)
-            end_time = int(datetime.now().timestamp() * 1000)
-
             endpoint = f"/stat/report/{granularity}.user"
             payload = {
                 "attrs": [
@@ -153,6 +223,8 @@ class StatsManager:
         client_id: str,
         duration_hours: int = 1,
         granularity: str = "hourly",
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Resolve a public MAC-or-id client identifier before fetching stats."""
         client = await self._client_manager.get_client_details(client_id, existence_only=True)
@@ -162,6 +234,8 @@ class StatsManager:
             client_mac,
             duration_hours=duration_hours,
             granularity=granularity,
+            start_ms=start_ms,
+            end_ms=end_ms,
         )
 
     async def get_device_stats(
@@ -263,20 +337,74 @@ class StatsManager:
             device_type=report_type,
         )
 
-    async def get_top_clients(self, duration_hours: int = 24, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get top clients by usage.
+    async def get_top_clients(
+        self,
+        duration_hours: int = 24,
+        limit: int = 10,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        granularity: Optional[str] = None,
+        sort_by: str = "total",
+    ) -> List[Dict[str, Any]]:
+        """Rank clients by traffic inside a time window.
 
-        Fallback approach: derive usage from current client objects when report
-        endpoints return no data. Values are cumulative since association and
-        are sufficient for ranking purposes.
+        Sums the controller's per-client report (``/stat/report/<g>.user``) over
+        the window, so the ranking answers "who moved data between X and Y".
+        In that report ``rx_bytes`` is what the client sent (upload) and
+        ``tx_bytes`` what it received (download), seen from the network side.
+
+        The report only covers clients the controller meters per client, which
+        on current gateways means wireless clients; wired clients are absent
+        from it. When the report yields nothing at all (older controllers), the
+        ranking falls back to cumulative counters of currently connected
+        clients, marked ``source="live_counters"`` because they are not scoped
+        to the window.
         """
+        if sort_by not in ("total", "upload", "download"):
+            raise ValueError("sort_by must be one of: total, upload, download")
+        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
+        granularity = _resolve_granularity(granularity) if granularity else _auto_granularity(start_time)
+        sort_key = {"total": "total_bytes", "upload": "upload_bytes", "download": "download_bytes"}[sort_by]
+
+        cache_key = f"stats_top_clients_{start_time // 60000}_{end_time // 60000}_{granularity}_{self._connection.site}"
+        per_client = self._connection.get_cached(cache_key, timeout=120)
+        if per_client is None:
+            api_request = ApiRequest(
+                method="post",
+                path=f"/stat/report/{granularity}.user",
+                data={"attrs": ["rx_bytes", "tx_bytes", "time"], "start": start_time, "end": end_time},
+            )
+            response = await self._connection.request(api_request)
+            rows = response if isinstance(response, list) else []
+            totals: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                mac = normalize_mac(row.get("user") or row.get("mac") or "")
+                if not mac:
+                    continue
+                entry = totals.setdefault(mac, {"mac": mac, "upload_bytes": 0, "download_bytes": 0})
+                entry["upload_bytes"] += int(row.get("rx_bytes") or 0)
+                entry["download_bytes"] += int(row.get("tx_bytes") or 0)
+            per_client = []
+            for entry in totals.values():
+                entry["rx_bytes"] = entry["upload_bytes"]
+                entry["tx_bytes"] = entry["download_bytes"]
+                entry["total_bytes"] = entry["upload_bytes"] + entry["download_bytes"]
+                entry.update({"source": "report", "granularity": granularity, "start": start_time, "end": end_time})
+                per_client.append(entry)
+            if per_client:
+                self._connection._update_cache(cache_key, per_client, timeout=120)
+
+        if not per_client:
+            per_client = await self._top_clients_from_live_counters()
+
+        ranked = sorted(per_client, key=lambda x: int(x.get(sort_key) or 0), reverse=True)
+        return ranked[:limit]
+
+    async def _top_clients_from_live_counters(self) -> List[Dict[str, Any]]:
+        """Cumulative counters of connected clients; not scoped to any window."""
         online_clients = await self._client_manager.get_clients()
         if not online_clients:
             return []
-
-        clients_raw = [c.raw if hasattr(c, "raw") else c for c in online_clients]
-
-        aggregated_stats: List[Dict[str, Any]] = []
 
         def _safe_int(value: Any) -> int:
             try:
@@ -288,33 +416,30 @@ class StatsManager:
             except Exception:
                 return 0
 
-        for client in clients_raw:
+        aggregated: List[Dict[str, Any]] = []
+        for client in (c.raw if hasattr(c, "raw") else c for c in online_clients):
             mac = client.get("mac")
             if not mac:
                 continue
-
-            # Prefer explicit total if present, otherwise sum rx/tx (wifi + wired)
             rx = _safe_int(client.get("rx_bytes")) + _safe_int(
                 client.get("wired_rx_bytes") or client.get("wired-rx_bytes")
             )
             tx = _safe_int(client.get("tx_bytes")) + _safe_int(
                 client.get("wired_tx_bytes") or client.get("wired-tx_bytes")
             )
-            total = _safe_int(client.get("bytes")) or (rx + tx)
-
-            aggregated_stats.append(
+            aggregated.append(
                 {
                     "mac": mac,
                     "name": client.get("name") or client.get("hostname", mac),
                     "rx_bytes": rx,
                     "tx_bytes": tx,
-                    "total_bytes": total,
+                    "upload_bytes": rx,
+                    "download_bytes": tx,
+                    "total_bytes": _safe_int(client.get("bytes")) or (rx + tx),
+                    "source": "live_counters",
                 }
             )
-
-        # Sort by total bytes descending and return top N
-        sorted_clients = sorted(aggregated_stats, key=lambda x: x["total_bytes"], reverse=True)
-        return sorted_clients[:limit]
+        return aggregated
 
     async def get_dpi_stats(
         self,
@@ -490,49 +615,100 @@ class StatsManager:
             logger.error("Error getting speedtest results: %s", e)
             raise
 
-    async def get_site_dpi_traffic(self, by: str = "by_app") -> List[Dict[str, Any]]:
-        """Get site-level DPI traffic statistics.
+    async def _get_v2_traffic(self, start_ms: int, end_ms: int) -> Dict[str, Any]:
+        """Read the v2 DPI traffic aggregate (Network 9.x+) for a window."""
+        api_request = ApiRequestV2(
+            method="get",
+            path=f"/traffic?start={start_ms}&end={end_ms}&includeTrafficUsage=true&includeUnidentified=true",
+        )
+        return _v2_traffic_payload(await self._connection.request(api_request))
+
+    async def get_site_dpi_traffic(
+        self,
+        by: str = "by_app",
+        duration_hours: int = 24,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get site-level DPI traffic statistics for a window.
+
+        Uses the v2 traffic aggregate when the controller has it, else the
+        legacy ``/stat/sitedpi`` (which has no window and is empty on 10.x).
 
         Args:
             by: Grouping type, e.g. 'by_app' or 'by_cat'.
         """
-        cache_key = f"{CACHE_PREFIX_STATS_SITE_DPI}_{by}_{self._connection.site}"
-        cached_data = self._connection.get_cached(cache_key, timeout=900)  # 15 minute cache
+        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
+        cache_key = (
+            f"{CACHE_PREFIX_STATS_SITE_DPI}_{by}_{start_time // 60000}_{end_time // 60000}_{self._connection.site}"
+        )
+        cached_data = self._connection.get_cached(cache_key, timeout=300)
         if cached_data is not None:
             return cached_data
 
         try:
-            endpoint = "/stat/sitedpi"
-            payload = {"type": by}
-            api_request = ApiRequest(method="post", path=endpoint, data=payload)
-            response = await self._connection.request(api_request)
-            result = response if isinstance(response, list) else []
-            self._connection._update_cache(cache_key, result, timeout=900)
+            try:
+                payload = await self._get_v2_traffic(start_time, end_time)
+            except Exception as v2_error:
+                logger.debug("v2 traffic aggregate unavailable (%s); using /stat/sitedpi", type(v2_error).__name__)
+                payload = {}
+            if "total_usage_by_app" in payload:
+                result = _group_dpi_usage(payload.get("total_usage_by_app") or [], by)
+            else:
+                api_request = ApiRequest(method="post", path="/stat/sitedpi", data={"type": by})
+                response = await self._connection.request(api_request)
+                result = response if isinstance(response, list) else []
+            self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
             logger.error("Error getting site DPI traffic: %s", e)
             raise
 
-    async def get_client_dpi_traffic(self, client_mac: str, by: str = "by_app") -> List[Dict[str, Any]]:
-        """Get DPI traffic statistics for a specific client.
+    async def get_client_dpi_traffic(
+        self,
+        client_mac: str,
+        by: str = "by_app",
+        duration_hours: int = 24,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get DPI traffic statistics for one client over a window.
+
+        Uses the v2 traffic aggregate when the controller has it, else the
+        legacy ``/stat/stadpi`` (which has no window and is empty on 10.x).
 
         Args:
             client_mac: MAC address of the client.
             by: Grouping type, e.g. 'by_app' or 'by_cat'.
         """
         client_mac = normalize_mac(client_mac) or client_mac
-        cache_key = f"{CACHE_PREFIX_STATS_CLIENT_DPI}_{client_mac}_{by}_{self._connection.site}"
-        cached_data = self._connection.get_cached(cache_key, timeout=900)  # 15 minute cache
+        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
+        cache_key = (
+            f"{CACHE_PREFIX_STATS_CLIENT_DPI}_{client_mac}_{by}_{start_time // 60000}_{end_time // 60000}"
+            f"_{self._connection.site}"
+        )
+        cached_data = self._connection.get_cached(cache_key, timeout=300)
         if cached_data is not None:
             return cached_data
 
         try:
-            endpoint = "/stat/stadpi"
-            payload = {"type": by, "macs": [client_mac]}
-            api_request = ApiRequest(method="post", path=endpoint, data=payload)
-            response = await self._connection.request(api_request)
-            result = response if isinstance(response, list) else []
-            self._connection._update_cache(cache_key, result, timeout=900)
+            try:
+                payload = await self._get_v2_traffic(start_time, end_time)
+            except Exception as v2_error:
+                logger.debug("v2 traffic aggregate unavailable (%s); using /stat/stadpi", type(v2_error).__name__)
+                payload = {}
+            if "client_usage_by_app" in payload:
+                usage: List[Dict[str, Any]] = []
+                for entry in payload.get("client_usage_by_app") or []:
+                    client = entry.get("client") or {}
+                    if mac_equal(client.get("mac"), client_mac):
+                        usage.extend(entry.get("usage_by_app") or [])
+                result = _group_dpi_usage(usage, by)
+            else:
+                api_request = ApiRequest(method="post", path="/stat/stadpi", data={"type": by, "macs": [client_mac]})
+                response = await self._connection.request(api_request)
+                result = response if isinstance(response, list) else []
+            self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
             logger.error("Client DPI traffic read failed: %s", type(e).__name__)
@@ -593,18 +769,18 @@ class StatsManager:
 
     async def _get_security_events_v2(self, start_time: int, end_time: int, limit: int) -> List[Dict[str, Any]]:
         """Fallback for controllers where legacy IPS events no longer exist."""
+        # Threat blocks are logged with show_on_dashboard=false, so the
+        # dashboard-only /system-log/critical view never contains them; the
+        # full log filtered to the SECURITY category does (verified on 10.6).
         api_request = ApiRequestV2(
             method="post",
-            path="/system-log/critical",
+            path="/system-log/all",
             data={
                 "timestampFrom": start_time,
                 "timestampTo": end_time,
-                "severities": ["HIGH", "VERY_HIGH"],
                 "categories": ["SECURITY"],
-                "type": "GENERAL",
                 "pageNumber": 0,
                 "pageSize": min(limit, 100),
-                "searchText": "",
             },
         )
         response = await self._connection.request(api_request)
