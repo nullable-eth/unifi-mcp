@@ -287,7 +287,7 @@ class TestStatsManagerEnhanced:
         assert result == v2_events
         assert mock_connection.request.call_count == 2
         assert mock_connection.request.call_args_list[0][0][0].path == "/stat/ips/event"
-        assert mock_connection.request.call_args_list[1][0][0].path == "/system-log/critical"
+        assert mock_connection.request.call_args_list[1][0][0].path == "/system-log/all"
 
     @pytest.mark.asyncio
     async def test_get_ips_events_non_empty_legacy_skips_v2(self, stats_manager, mock_connection):

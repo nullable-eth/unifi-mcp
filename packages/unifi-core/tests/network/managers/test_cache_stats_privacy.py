@@ -33,7 +33,14 @@ def test_cache_logs_do_not_disclose_keys_or_prefixes(caplog: pytest.LogCaptureFi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "method", ["get_client_dpi_traffic", "get_client_wifi_details", "get_client_sessions", "_get_device_stat"]
+    "method",
+    [
+        "get_client_dpi_traffic",
+        "get_site_dpi_traffic",
+        "get_client_wifi_details",
+        "get_client_sessions",
+        "_get_device_stat",
+    ],
 )
 async def test_client_device_failure_translation_is_safe(method: str, caplog: pytest.LogCaptureFixture) -> None:
     connection = MagicMock()
@@ -44,7 +51,9 @@ async def test_client_device_failure_translation_is_safe(method: str, caplog: py
     manager = SwitchManager(connection) if method == "_get_device_stat" else StatsManager(connection, MagicMock())
     with caplog.at_level(logging.DEBUG), pytest.raises(RequestError) as caught:
         await getattr(manager, method)(MAC)
-    connection.request.assert_awaited_once()
+    # DPI tries the v2 aggregate before the legacy endpoint, so it may await twice;
+    # what matters here is that no attempt leaks the MAC or controller text.
+    connection.request.assert_awaited()
     rendered = "".join(traceback.format_exception(caught.value))
     assert "RuntimeError" in str(caught.value)
     assert caught.value.__suppress_context__ is True
