@@ -33,9 +33,10 @@ that bleed across package boundaries.
 ## Prerequisites
 
 - All feature PRs for the release are merged to `main`.
-- **All PRs targeting main must pass the pin-alignment CI gate (automated blocker).** This gate
-  runs on every PR and blocks stale transitive dependency pins that would cause fresh
-  installs to fail. See Procedure D, Step 0 for details.
+- **PRs that change any package's `pyproject.toml` or `src/` must pass the pin-alignment CI gate
+  (automated blocker).** The gate builds the workspace wheels and installs them the way a user
+  would, so a downstream floor that cannot work on PyPI fails before release. See Procedure D,
+  Step 0 for exactly what it covers and what it cannot see.
 - Working tree is clean: `git status` shows nothing staged or modified.
 - Remote is current: `git fetch origin && git log origin/main..HEAD` shows nothing.
 - PyPI credentials are **not** stored locally — publishing is handled entirely by
@@ -203,9 +204,24 @@ Each package must declare both `tag_regex` and `git_describe_command` scoped to 
 
 ### Step 0: Pin-Alignment CI Gate (Automated Blocker)
 
-The pin-alignment CI gate runs on every PR and **cannot be skipped**. It validates that every downstream package's dependency bounds permit the versions of upstream packages on main. If your PR fails: look at the CI output for the specific package and bound that failed, update the offending bounds in `pyproject.toml`, commit and push.
+The pin-alignment CI gate (`scripts/check_pin_alignment.py`, workflow `check-pin-alignment.yml`) runs on a PR that touches any of: a package's `pyproject.toml`, anything under `apps/*/src/**` or `packages/*/src/**` (core, shared, relay and every app), the API's force-included `alembic` files, the gate script, the workflow, or `scripts/generate_api_action_catalog.py`. If your PR fails: read the CI output for the failing package and module, update the offending bounds in `pyproject.toml` (or split the change, see the floor-bump sequencing gotcha), commit and push.
 
-**CI gate gap — import-only PRs:** The pin-alignment gate fires only when `pyproject.toml` changes. A PR that adds code using a new cross-package API (new import from `unifi-core` or `unifi-mcp-shared`) without updating the floor bound in `pyproject.toml` passes CI even when the published upstream wheel's metadata would reject the resolved version at user install time. Manually verify dependency bounds for any PR that expands cross-package imports.
+**What the gate proves, against PyPI plus the workspace-built upstream wheels:**
+
+1. Every built wheel declares the advisory-safe dependency floors, the Network and API wheels exactly pin `aiounifi` / `aiohttp` consistently, and the prior vulnerable resolutions upgrade to safe versions.
+2. Each downstream wheel installs into a clean venv, with the declared ranges resolved from PyPI. Then **every module the wheel ships is imported**. The module list comes from the installed distribution's file list, so directories without an `__init__.py` (Network's `tools/` and `utils/`) are included. Any `ImportError` fails the gate: an undeclared dependency (`ModuleNotFoundError`) and a symbol the resolved upstream does not provide (`cannot import name`). Other import-time exceptions are ignored.
+3. Each downstream wheel is installed again against **exactly its declared minimum** `unifi-core` (and, for Protect, Access and Relay, its declared minimum `unifi-mcp-shared`). The same full module import runs against those floors, so a symbol imported from a newer upstream than the floor admits fails even though the latest upstream has it.
+4. An AST scan of the installed downstream source resolves every attribute reached through an `unifi_core` / `unifi_mcp_shared` import (`import unifi_core.x as x; x.new_helper`, `from unifi_core.x import Cls; Cls.new_method`) against those floor versions. This covers use that only fails when the line runs.
+5. Network and API additionally run manager-call contracts against the Core floor: every direct `<name>_manager.<method>` call in the Network tool modules, and every API catalog binding, must exist with a compatible signature.
+
+**What the gate cannot see (verify these by hand):**
+
+- **Calls on objects the scan cannot resolve statically.** Attribute access on instances, parameters, return values, or any name that is rebound in the same file (`client = Cls(); client.new_method()`) is skipped. Network and API are covered for manager calls by their contracts; Protect, Access and Relay have no equivalent, so a new Core method called on a manager instance without a floor bump passes. Review any PR that starts calling new upstream methods against the upstream's changelog.
+- **Behavior changes with the same API shape.** A floor is checked for symbol existence and signatures, not semantics.
+- **The Shared floor of Network and API.** Network is installed with the branch-built Shared candidate (the release being cut), and the API wheel declares no direct Shared dependency, so neither is tested against its minimum published Shared.
+- **Transitive chains.** Only each package's own declared bounds are validated; see the coverage limit below.
+- **Imports that do not run at import time.** An import inside a function body never runs when the module is imported, and an import under `try/except ImportError` has its failure swallowed; the attribute scan resolves neither. A symbol absent from the floor that is only imported that way passes.
+- **Import-time exceptions other than `ImportError`** (for example a module that needs a live controller at import) are ignored, so that module's imports after the failure point go unchecked.
 
 ### Align Cross-Package Dependency Bounds Before Tagging
 
@@ -226,15 +242,16 @@ Workspace `[tool.uv.sources]` overrides take precedence over the version range d
 
 `scripts/check_pin_alignment.py` validates the direct dependency bounds declared in each package's own `pyproject.toml` — it does not walk the full transitive/nested dependency chain (e.g., relay → shared → core, multiple hops deep). A downstream package can pass the gate while a deeper transitive package in the chain is still misaligned. When releasing a change that touches a multi-hop dependency chain, manually trace and verify bounds at each hop rather than trusting a single green run of this script.
 
-### `--api-core-floor-only` Flag — Cross-Package Bridge-Method Validation
+### Running one floor check locally: `--network-core-floor-only` and `--api-core-floor-only`
 
-When a downstream package (e.g., `unifi-api-server`) is changed to call new bridge methods added to an upstream shared package (`unifi-core`), run:
+The full gate takes several minutes because it builds every wheel and builds a venv per downstream. When a PR changes only how Network or the API uses upstream code, run just that wheel's floor check:
 
 ```bash
-python3 scripts/check_pin_alignment.py --api-core-floor-only
+uv run scripts/check_pin_alignment.py --network-core-floor-only
+uv run scripts/check_pin_alignment.py --api-core-floor-only
 ```
 
-This mode enforces that the downstream package's declared `unifi-core` floor bound in `pyproject.toml` is actually high enough to guarantee the new bridge methods exist — catching the case where code was written against an unreleased Core API before the floor bound was raised to match. Run this whenever a PR adds calls to newly-added `unifi-core` methods, in addition to the standard (no-flag) pin-alignment check.
+Each mode builds that one wheel, installs it against exactly its declared `unifi-core` minimum, and runs the manager-call contract, the full module import, and the upstream attribute scan described in Step 0. A failure means the code was written against an upstream API newer than the floor admits: either raise the floor (after the upstream version is on PyPI) or remove the use. Protect, Access and Relay have no single-package flag; they are checked by the full gate.
 
 ### Pre-tag wheel-metadata check
 
@@ -294,16 +311,27 @@ Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
   tagged and the pin moves; usually in or after the writeback.
 - **Enforcement.** `make check-plugin-versions` admits version bumps and pins;
   `make check-plugin-tool-refs` fails when a shipped plugin file names a tool absent
-  from the release tag its product's plugin pins (cross-product: the product pins plus
-  the latest released relay). Both run in `make pre-commit` and in the generated-artifacts
+  from the release tag its product's plugin pins (unifi-intelligence: the product pins plus
+  the latest released cloud worker). Both run in `make pre-commit` and in the generated-artifacts
   CI job. Never weaken either check to pass a PR; fix the plugin text or move the pin.
+- **Counts and references follow the pin.** Plugin skill tool counts and the generated
+  `references/*-tools.md` come from the manifest of the release tag each plugin pins
+  (`git show <tag>:<manifest>`), never the workspace: a server PR that adds a tool leaves
+  them unchanged, and the plugin release that moves the pin (the writeback runs
+  `generate_skill_references.py`) updates them. A new tool category needs its
+  `<!-- AUTO:tools:<category> -->` marker section added in that release.
 
 ### Versioning
 
 - Each plugin has an independent SemVer describing everything it ships, separate from
   the server pin. Set the same `version` in every existing Claude and Codex manifest
-  (at least one). The unlisted `cross-product` bundle uses its Claude manifest only.
+  (at least one). The skills-only `unifi-intelligence` bundle has both manifests, no MCP
+  config and no pin, and names the MCP plugins it needs in the Claude manifest's
+  `dependencies`; Codex and OpenClaw install no dependencies, so its descriptions say so.
   Keep `version` out of marketplace entries.
+- A renamed plugin is a new identity to every client, so it starts at `1.0.0`. The guard
+  checks a plugin with no files at the merge base as new and skips a removed one; say in
+  the upgrade guide what users of the old name do.
 - Bump every affected plugin in the same PR whenever any file under `plugins/<name>/`
   changes, including skills, references, setup scripts, MCP configs and docs. Version-only
   bumps are allowed.
@@ -317,19 +345,23 @@ Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
 - Writeback: `bump-plugin-versions.yml` runs
   `python3 scripts/plugin_versions.py sync --releasing <package-tag>`. It moves the inline
   Claude pin and the `.mcp.codex.json` pin, bumps the plugin by the size of the server move,
-  and regenerates `apps/<product>/server.json` with the **server** version. Retrying an
-  already-synced pin does not bump again. Core, Shared and Relay triggers only coalesce
+  regenerates `apps/<product>/server.json` with the **server** version, and inserts one
+  `CHANGELOG.md` entry naming every plugin it bumped and linking each server release.
+  Retrying an already-synced pin does not bump again. Core, Shared and Relay triggers only coalesce
   outstanding product tags, otherwise they write nothing.
 - `make check-plugin-versions` runs `scripts/plugin_versions.py check --base origin/main`;
   PR CI uses the PR base SHA. Fetch base history and tags first; a missing base fails.
   Changed plugin versions must be valid SemVer, agree across manifests and exceed the
-  merge-base version. Pins must agree and name release tags; only the workflow's exact
+  merge-base version, and `CHANGELOG.md` needs an entry heading naming `<plugin> <version>`
+  for each changed or new plugin. Pins must agree and name release tags; only the workflow's exact
   `--releasing` tag may stand in for a tag not yet discovered locally.
 
 ### Release checklist
 
-1. Bump the version by the rules above and write the user-visible changes in the PR
-   description; the squash commit carries them as the release notes.
+1. Bump the version by the rules above and add a `CHANGELOG.md` entry below its marker:
+   `## <YYYY-MM-DD UTC> — <plugin> <version>[, <plugin> <version>…]`, then the user-visible
+   changes in plain language (what users notice, not how it was built). Repeat them in the
+   PR description. The README describes what each plugin is; never put release notes there.
 2. Run `make pre-commit` (both plugin checks included).
 3. Merge as one squash merge.
 4. Tell users how to update, per the client table: Claude Code users update the
