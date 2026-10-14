@@ -5,6 +5,45 @@ lands. Install steps are in the [agent install guide](agent-install.md);
 prerequisites and verification status are in the
 [plugin support matrix](plugin-support.md).
 
+## unifi-intelligence 1.0.0
+
+The cross-product skills move from the unlisted `cross-product` bundle into a
+new plugin, `unifi-intelligence` ("UniFi Intelligence"), listed in the Claude
+Code and Codex marketplaces. It is a new plugin, so it starts at 1.0.0, and it
+ships skills only: Incident Investigation, Security Patrol and Visitor Audit.
+
+- **It requires `unifi-network` and `unifi-protect`.** Claude Code installs and
+  enables them with it. Codex and OpenClaw do not install plugin dependencies:
+  install and set up both first. See the
+  [install guide](agent-install.md#unifi-intelligence).
+- **Security Patrol and Visitor Audit need the cloud worker.** They call
+  `unifi_location_timeline`, which only the cloud worker provides, through a
+  connected relay; local servers do not. Both now read Access door events
+  separately, because the timeline reports Access as unsupported, and turn an
+  area into exact device MACs and camera IDs instead of passing an area name.
+- **If you installed the old bundle's skills** with
+  `npx skills add .../plugins/cross-product`, that path no longer exists. Remove
+  those skills with the skills CLI and install the plugin, or add the skills
+  again from `plugins/unifi-intelligence`.
+
+## 1.0.1
+
+`unifi-network`, `unifi-protect` and `unifi-access` move to 1.0.1 and start
+`unifi-network-mcp` 0.37.2, `unifi-protect-mcp` 0.8.19 and `unifi-access-mcp`
+0.6.14. Update as for any release; there is nothing to rerun.
+
+- **A down controller no longer fails the plugin.** The servers answer the
+  client at once and connect to the controller in the background. Before, a
+  controller that was down or slow kept the server from answering until the
+  client gave up and marked it failed. Tools now say the server is still
+  connecting or cannot reach the controller, and work again once it is back.
+- **Connection errors name the real cause.** A network failure says the
+  controller is unreachable; only a rejected login points at your credentials.
+- **Claude Code setup refuses to clear a keychain-held secret.** Setup refuses,
+  before writing, a change that would clear a password or API key Claude Code
+  holds in the system keychain, and says how to switch. See
+  [Moving a raw secret to a provider](#moving-a-raw-secret-to-a-provider).
+
 ## 1.0.0
 
 Every UniFi plugin (`unifi-network`, `unifi-protect`, `unifi-access` and the
@@ -303,12 +342,27 @@ password or API key on the command line.
    `UNIFI_NETWORK_API_KEY_COMMAND` the same way, with the matching
    `UNIFI_PROTECT_*` or `UNIFI_ACCESS_*` names for the other plugins.
 
-Selecting a spelling removes the other saved spellings of that secret, so the
-old raw value is removed in the same change. In Claude Code a migrated raw
-password or API key lands in the system keychain; the steps above replace it
-with a provider. You can also enter it in the masked password or API key field
-under `/plugin`, then the plugin, then **Configure options**, which keeps it in
-the keychain.
+In Codex and OpenClaw, selecting a spelling removes the other saved spellings of
+that secret, so the old raw value is removed in the same change.
+
+In Claude Code, a raw password or API key saved as an option (typed into the
+options, or moved there by `--migrate`) is held in the system keychain, and
+Claude Code cannot clear it: `claude plugin configure` and the options dialog
+ignore an empty value. Setup refuses the switch, names the variable and changes
+nothing. Either keep the saved secret, or uninstall and reinstall the plugin and
+then run setup with the provider:
+
+```bash
+claude plugin uninstall unifi-network@unifi-plugins
+claude plugin install unifi-network@unifi-plugins
+```
+
+Use `unifi-protect@unifi-plugins` or `unifi-access@unifi-plugins` for the other
+plugins. Uninstalling clears every option of the plugin, so set the host,
+username and your other options again; setup's message lists them. To replace
+the raw value with another one instead, enter it in the masked password or API
+key field under `/plugin`, then the plugin, then **Configure options**, which
+keeps it in the keychain.
 
 To supply a raw value deliberately, pipe a JSON patch from a private file:
 `set-env.sh --target <target> --input-json < private.json`
@@ -345,7 +399,9 @@ Hermes Agent cannot load the current plugin layout and is not supported.
 - If Claude Code reports a keychain write but does not keep it, setup restores
   the previous non-secret options and says so, but cannot restore the previous
   keychain value. Re-enter it, or switch to a file or command provider.
-- The `cross-product` bundle stays unlisted in both marketplaces. Its
-  merged-timeline workflows need the relay's `unifi_location_timeline` tool,
-  which local servers do not provide. See
+- The unlisted `cross-product` bundle has become the listed
+  `unifi-intelligence` plugin; see
+  [unifi-intelligence 1.0.0](#unifi-intelligence-100). Its Security Patrol and
+  Visitor Audit workflows need `unifi_location_timeline`, which the cloud
+  worker provides through a connected relay and local servers do not. See
   [Cross-Product Capabilities](cross-product.md).
