@@ -61,17 +61,36 @@ _AUTO_5MIN_MAX_AGE_MS = 12 * 3600 * 1000
 _AUTO_HOURLY_MAX_AGE_MS = 7 * 24 * 3600 * 1000
 
 
+def _now_ms() -> int:
+    return int(datetime.now().timestamp() * 1000)
+
+
+def _safe_int(value: Any) -> int:
+    """Parse a controller counter, treating anything non-numeric as 0."""
+    try:
+        if value is None:
+            return 0
+        if isinstance(value, (bool, int, float)):
+            return int(value)  # NaN and infinity raise and are caught below
+        return int(str(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _window_ms(
     duration_hours: int,
     start_ms: Optional[int] = None,
     end_ms: Optional[int] = None,
+    now_ms: Optional[int] = None,
 ) -> tuple[int, int]:
     """Resolve a report window in epoch milliseconds.
 
     An explicit ``start_ms`` wins over ``duration_hours``; ``end_ms`` defaults
-    to now. Raises ValueError for an empty or inverted window.
+    to ``now_ms`` (the current time unless given). Raises ValueError for an
+    empty or inverted window.
     """
-    now_ms = int(datetime.now().timestamp() * 1000)
+    if now_ms is None:
+        now_ms = _now_ms()
     end = int(end_ms) if end_ms is not None else now_ms
     start = int(start_ms) if start_ms is not None else end - int(duration_hours) * 3600 * 1000
     if start >= end:
@@ -91,14 +110,39 @@ def _window_cache_key(start: int, end: int, start_ms: Optional[int], end_ms: Opt
     return f"{start_part}_{end_part}"
 
 
-def _auto_granularity(start_ms: int) -> str:
-    """Pick the finest report granularity the controller still retains for start_ms."""
-    age = int(datetime.now().timestamp() * 1000) - start_ms
+def _auto_granularity(start_ms: int, now_ms: int) -> str:
+    """Pick the finest report granularity the controller still retains for start_ms.
+
+    ``now_ms`` must be the same instant the window was resolved against, so a
+    window exactly on a retention threshold always gets the same answer.
+    """
+    age = now_ms - start_ms
     if age <= _AUTO_5MIN_MAX_AGE_MS:
         return "5minutes"
     if age <= _AUTO_HOURLY_MAX_AGE_MS:
         return "hourly"
     return "daily"
+
+
+_IPS_SUBCATEGORY = "SECURITY_INTRUSION_PREVENTION"
+_IPS_V2_PAGE_SIZE = 100
+_IPS_V2_MAX_PAGES = 10
+
+
+def _system_log_rows(response: Any) -> List[Dict[str, Any]]:
+    """Unwrap a v2 system-log page, which arrives as a dict, a one-element list or a bare list."""
+    if isinstance(response, list) and response and isinstance(response[0], dict) and "data" in response[0]:
+        data: Any = response[0]["data"]
+    elif isinstance(response, dict):
+        data = response.get("data", response.get("logs", []))
+    else:
+        data = response
+    return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+
+
+def _is_ips_event(row: Dict[str, Any]) -> bool:
+    """True for intrusion-prevention rows; the SECURITY category also holds firewall blocks."""
+    return row.get("subcategory") == _IPS_SUBCATEGORY
 
 
 def _v2_traffic_payload(response: Any) -> Dict[str, Any]:
@@ -118,15 +162,15 @@ def _group_dpi_usage(entries: List[Dict[str, Any]], by: str) -> List[Dict[str, A
                 cat, {"category": cat, "bytes_transmitted": 0, "bytes_received": 0, "total_bytes": 0}
             )
             for k in ("bytes_transmitted", "bytes_received", "total_bytes"):
-                row[k] += int(e.get(k) or 0)
+                row[k] += _safe_int(e.get(k))
         rows = list(folded.values())
     else:
         rows = [dict(e) for e in entries]
     for row in rows:
         # v2 counts from the client's side: transmitted = uploaded by the client.
-        row["upload_bytes"] = int(row.get("bytes_transmitted") or 0)
-        row["download_bytes"] = int(row.get("bytes_received") or 0)
-    return sorted(rows, key=lambda r: int(r.get("total_bytes") or 0), reverse=True)
+        row["upload_bytes"] = _safe_int(row.get("bytes_transmitted"))
+        row["download_bytes"] = _safe_int(row.get("bytes_received"))
+    return sorted(rows, key=lambda r: _safe_int(r.get("total_bytes")), reverse=True)
 
 
 class StatsManager:
@@ -197,7 +241,7 @@ class StatsManager:
         client_mac = normalize_mac(client_mac) or client_mac
         granularity = _resolve_granularity(granularity)
         start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
-        window_key = f"{start_ms}_{end_ms}" if start_ms is not None or end_ms is not None else str(duration_hours)
+        window_key = _window_cache_key(start_time, end_time, start_ms, end_ms)
         cache_key = f"{CACHE_PREFIX_STATS_CLIENT}_{client_mac}_{window_key}_{granularity}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=300)  # 5 minute cache
         if cached_data is not None:
@@ -367,16 +411,20 @@ class StatsManager:
 
         The report only covers clients the controller meters per client, which
         on current gateways means wireless clients; wired clients are absent
-        from it. When the report yields nothing at all (older controllers), the
-        ranking falls back to cumulative counters of currently connected
-        clients, marked ``source="live_counters"`` because they are not scoped
-        to the window.
+        from it. When the report yields nothing for a duration-based window
+        (older controllers), the ranking falls back to cumulative counters of
+        currently connected clients, marked ``source="live_counters"`` because
+        they are not scoped to the window. A caller-pinned ``start_ms`` or
+        ``end_ms`` never falls back: lifetime counters would describe a
+        different period, so an empty window returns an empty ranking.
         """
         if sort_by not in ("total", "upload", "download"):
             raise ValueError("sort_by must be one of: total, upload, download")
-        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms)
-        granularity = _resolve_granularity(granularity) if granularity else _auto_granularity(start_time)
+        now_ms = _now_ms()
+        start_time, end_time = _window_ms(duration_hours, start_ms, end_ms, now_ms)
+        granularity = _resolve_granularity(granularity) if granularity else _auto_granularity(start_time, now_ms)
         sort_key = {"total": "total_bytes", "upload": "upload_bytes", "download": "download_bytes"}[sort_by]
+        explicit_window = start_ms is not None or end_ms is not None
 
         cache_key = (
             f"stats_top_clients_{_window_cache_key(start_time, end_time, start_ms, end_ms)}"
@@ -384,52 +432,56 @@ class StatsManager:
         )
         per_client = self._connection.get_cached(cache_key, timeout=120)
         if per_client is None:
-            api_request = ApiRequest(
-                method="post",
-                path=f"/stat/report/{granularity}.user",
-                data={"attrs": ["rx_bytes", "tx_bytes", "time"], "start": start_time, "end": end_time},
-            )
-            response = await self._connection.request(api_request)
-            rows = response if isinstance(response, list) else []
-            totals: Dict[str, Dict[str, Any]] = {}
-            for row in rows:
-                mac = normalize_mac(row.get("user") or row.get("mac") or "")
-                if not mac:
-                    continue
-                entry = totals.setdefault(mac, {"mac": mac, "upload_bytes": 0, "download_bytes": 0})
-                entry["upload_bytes"] += int(row.get("rx_bytes") or 0)
-                entry["download_bytes"] += int(row.get("tx_bytes") or 0)
-            per_client = []
-            for entry in totals.values():
-                entry["rx_bytes"] = entry["upload_bytes"]
-                entry["tx_bytes"] = entry["download_bytes"]
-                entry["total_bytes"] = entry["upload_bytes"] + entry["download_bytes"]
-                entry.update({"source": "report", "granularity": granularity, "start": start_time, "end": end_time})
-                per_client.append(entry)
+            try:
+                per_client = await self._top_clients_from_report(granularity, start_time, end_time)
+            except Exception as e:
+                logger.error("Top clients report read failed: %s", type(e).__name__)
+                raise RequestError(f"Top clients report read failed ({type(e).__name__}).") from None
             if per_client:
                 self._connection._update_cache(cache_key, per_client, timeout=120)
 
         if not per_client:
+            if explicit_window:
+                return []
             per_client = await self._top_clients_from_live_counters()
 
         ranked = sorted(per_client, key=lambda x: int(x.get(sort_key) or 0), reverse=True)
         return ranked[:limit]
+
+    async def _top_clients_from_report(self, granularity: str, start_time: int, end_time: int) -> List[Dict[str, Any]]:
+        """Sum the per-client report over a window, one entry per client MAC."""
+        api_request = ApiRequest(
+            method="post",
+            path=f"/stat/report/{granularity}.user",
+            data={"attrs": ["rx_bytes", "tx_bytes", "time"], "start": start_time, "end": end_time},
+        )
+        response = await self._connection.request(api_request)
+        rows = response if isinstance(response, list) else []
+        totals: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_mac = row.get("user") or row.get("mac")
+            mac = normalize_mac(raw_mac) if isinstance(raw_mac, str) else None
+            if not mac:
+                continue
+            entry = totals.setdefault(mac, {"mac": mac, "upload_bytes": 0, "download_bytes": 0})
+            entry["upload_bytes"] += _safe_int(row.get("rx_bytes"))
+            entry["download_bytes"] += _safe_int(row.get("tx_bytes"))
+        per_client = []
+        for entry in totals.values():
+            entry["rx_bytes"] = entry["upload_bytes"]
+            entry["tx_bytes"] = entry["download_bytes"]
+            entry["total_bytes"] = entry["upload_bytes"] + entry["download_bytes"]
+            entry.update({"source": "report", "granularity": granularity, "start": start_time, "end": end_time})
+            per_client.append(entry)
+        return per_client
 
     async def _top_clients_from_live_counters(self) -> List[Dict[str, Any]]:
         """Cumulative counters of connected clients; not scoped to any window."""
         online_clients = await self._client_manager.get_clients()
         if not online_clients:
             return []
-
-        def _safe_int(value: Any) -> int:
-            try:
-                if value is None:
-                    return 0
-                if isinstance(value, bool):
-                    return int(value)
-                return int(str(value))
-            except Exception:
-                return 0
 
         aggregated: List[Dict[str, Any]] = []
         for client in (c.raw if hasattr(c, "raw") else c for c in online_clients):
@@ -663,18 +715,24 @@ class StatsManager:
             return cached_data
 
         try:
+            v2_failed = False
             try:
                 payload = await self._get_v2_traffic(start_time, end_time)
             except Exception as v2_error:
                 logger.debug("v2 traffic aggregate unavailable (%s); using /stat/sitedpi", type(v2_error).__name__)
                 payload = {}
+                v2_failed = True
             if "total_usage_by_app" in payload:
                 result = _group_dpi_usage(payload.get("total_usage_by_app") or [], by)
             else:
                 api_request = ApiRequest(method="post", path="/stat/sitedpi", data={"type": by})
                 response = await self._connection.request(api_request)
                 result = response if isinstance(response, list) else []
-            self._connection._update_cache(cache_key, result, timeout=300)
+            # On 10.x the legacy endpoint is always empty, so an empty answer after a
+            # v2 failure says nothing about the window; leave it uncached so a
+            # transient v2 error is retried instead of held as "no traffic".
+            if result or not v2_failed:
+                self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
             logger.error("Site DPI traffic read failed: %s", type(e).__name__)
@@ -706,11 +764,13 @@ class StatsManager:
             return cached_data
 
         try:
+            v2_failed = False
             try:
                 payload = await self._get_v2_traffic(start_time, end_time)
             except Exception as v2_error:
                 logger.debug("v2 traffic aggregate unavailable (%s); using /stat/stadpi", type(v2_error).__name__)
                 payload = {}
+                v2_failed = True
             if "client_usage_by_app" in payload:
                 usage: List[Dict[str, Any]] = []
                 for entry in payload.get("client_usage_by_app") or []:
@@ -722,7 +782,9 @@ class StatsManager:
                 api_request = ApiRequest(method="post", path="/stat/stadpi", data={"type": by, "macs": [client_mac]})
                 response = await self._connection.request(api_request)
                 result = response if isinstance(response, list) else []
-            self._connection._update_cache(cache_key, result, timeout=300)
+            # As for site DPI: an empty legacy answer after a v2 failure is not cached.
+            if result or not v2_failed:
+                self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
             logger.error("Client DPI traffic read failed: %s", type(e).__name__)
@@ -786,26 +848,27 @@ class StatsManager:
         # Threat blocks are logged with show_on_dashboard=false, so the
         # dashboard-only /system-log/critical view never contains them; the
         # full log filtered to the SECURITY category does (verified on 10.6).
-        api_request = ApiRequestV2(
-            method="post",
-            path="/system-log/all",
-            data={
-                "timestampFrom": start_time,
-                "timestampTo": end_time,
-                "categories": ["SECURITY"],
-                "pageNumber": 0,
-                "pageSize": min(limit, 100),
-            },
-        )
-        response = await self._connection.request(api_request)
-        if isinstance(response, list) and response and isinstance(response[0], dict) and "data" in response[0]:
-            return response[0]["data"][:limit]
-        if isinstance(response, dict):
-            data = response.get("data", response.get("logs", []))
-            return data[:limit] if isinstance(data, list) else []
-        if isinstance(response, list):
-            return response[:limit]
-        return []
+        # That category also carries ordinary firewall blocks, so rows are
+        # narrowed to the intrusion-prevention subcategory before the limit is
+        # applied, reading further pages while firewall rows crowd them out.
+        events: List[Dict[str, Any]] = []
+        for page_number in range(_IPS_V2_MAX_PAGES):
+            api_request = ApiRequestV2(
+                method="post",
+                path="/system-log/all",
+                data={
+                    "timestampFrom": start_time,
+                    "timestampTo": end_time,
+                    "categories": ["SECURITY"],
+                    "pageNumber": page_number,
+                    "pageSize": _IPS_V2_PAGE_SIZE,
+                },
+            )
+            rows = _system_log_rows(await self._connection.request(api_request))
+            events.extend(row for row in rows if _is_ips_event(row))
+            if len(events) >= limit or len(rows) < _IPS_V2_PAGE_SIZE:
+                break
+        return events[:limit]
 
     async def get_client_sessions(
         self,

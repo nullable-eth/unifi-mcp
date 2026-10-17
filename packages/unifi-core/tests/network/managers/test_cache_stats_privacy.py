@@ -62,3 +62,27 @@ async def test_client_device_failure_translation_is_safe(method: str, caplog: py
         assert value not in str(caught.value)
         assert value not in rendered
     assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_top_clients_report_failure_translation_is_safe(explicit: bool, caplog: pytest.LogCaptureFixture) -> None:
+    connection = MagicMock()
+    connection.site = "default"
+    connection.get_cached.return_value = None
+    connection.request = AsyncMock(side_effect=RuntimeError(f"{MAC} {CANARY}"))
+    client_manager = MagicMock()
+    client_manager.get_clients = AsyncMock(return_value=[])
+    manager = StatsManager(connection, client_manager)
+    window = {"start_ms": 1_000, "end_ms": 2_000} if explicit else {}
+    with caplog.at_level(logging.DEBUG), pytest.raises(RequestError) as caught:
+        await manager.get_top_clients(**window)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "RuntimeError" in str(caught.value)
+    assert caught.value.__suppress_context__ is True
+    for value in (MAC, CANARY):
+        assert value not in caplog.text
+        assert value not in str(caught.value)
+        assert value not in rendered
+    assert all(record.exc_info is None for record in caplog.records)
+    client_manager.get_clients.assert_not_awaited()

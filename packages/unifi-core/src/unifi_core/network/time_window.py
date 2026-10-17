@@ -29,23 +29,36 @@ def duration_hours(duration: Any) -> int:
 def parse_window_bound(value: Any) -> Optional[int]:
     """Parse an ISO 8601 or epoch (seconds or milliseconds) bound to epoch milliseconds.
 
-    Naive ISO timestamps are read in the server's local time zone.
+    ``None`` means the bound was omitted. Everything else must name a time: a
+    blank string is rejected rather than treated as omitted, and an ISO
+    timestamp must carry ``Z`` or a UTC offset, because a naive one would be
+    read in whatever time zone the server runs in (the same rule as the
+    incident-window parser in ``unifi_core.incident_collection``).
     """
     if value is None:
         return None
     if isinstance(value, bool):
-        raise ValueError(f"Invalid time '{value}': use ISO 8601 or epoch seconds/milliseconds")
+        raise ValueError(f"Invalid time '{value}': use ISO 8601 with a UTC offset or epoch seconds/milliseconds")
     if isinstance(value, (int, float)):
         number = int(value)
         return number if number >= 10**12 else number * 1000
     text = str(value).strip()
     if not text:
-        return None
+        raise ValueError(
+            "Empty time bound: omit start/end to use the duration window, or pass ISO 8601 "
+            "with a UTC offset (for example 2026-08-08T12:00:00Z) or epoch seconds/milliseconds"
+        )
     if text.isdigit():
         number = int(text)
         return number if number >= 10**12 else number * 1000
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise ValueError(f"Invalid time '{value}': use ISO 8601 or epoch seconds/milliseconds") from None
+        raise ValueError(
+            f"Invalid time '{value}': use ISO 8601 with a UTC offset or epoch seconds/milliseconds"
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            f"Time '{value}' needs an explicit UTC offset (Z or +HH:MM); without one the time is ambiguous"
+        )
     return int(parsed.timestamp() * 1000)
