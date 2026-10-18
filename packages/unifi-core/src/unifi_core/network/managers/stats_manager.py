@@ -129,15 +129,21 @@ _IPS_V2_PAGE_SIZE = 100
 _IPS_V2_MAX_PAGES = 10
 
 
-def _system_log_rows(response: Any) -> List[Dict[str, Any]]:
-    """Unwrap a v2 system-log page, which arrives as a dict, a one-element list or a bare list."""
+def _system_log_page(response: Any) -> tuple[List[Dict[str, Any]], int]:
+    """Unwrap a v2 system-log page, which arrives as a dict, a one-element list or a bare list.
+
+    Returns the dict rows and the page's raw row count, so a junk row doesn't make a
+    full page look short.
+    """
     if isinstance(response, list) and response and isinstance(response[0], dict) and "data" in response[0]:
         data: Any = response[0]["data"]
     elif isinstance(response, dict):
         data = response.get("data", response.get("logs", []))
     else:
         data = response
-    return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return [], 0
+    return [row for row in data if isinstance(row, dict)], len(data)
 
 
 def _is_ips_event(row: Dict[str, Any]) -> bool:
@@ -443,7 +449,11 @@ class StatsManager:
         if not per_client:
             if explicit_window:
                 return []
-            per_client = await self._top_clients_from_live_counters()
+            try:
+                per_client = await self._top_clients_from_live_counters()
+            except Exception as e:
+                logger.error("Top clients live counter read failed: %s", type(e).__name__)
+                raise RequestError(f"Top clients live counter read failed ({type(e).__name__}).") from None
 
         ranked = sorted(per_client, key=lambda x: int(x.get(sort_key) or 0), reverse=True)
         return ranked[:limit]
@@ -819,7 +829,9 @@ class StatsManager:
                 response = await self._connection.request(api_request)
             except Exception as legacy_error:
                 logger.debug("Legacy IPS endpoint failed, falling back to v2 security logs: %s", legacy_error)
-                response = await self._get_security_events_v2(start_time, end_time, limit)
+                response, complete = await self._get_security_events_v2(start_time, end_time, limit)
+                if not complete:
+                    return response
             else:
                 # A controller that has moved IPS events to the v2 system log answers
                 # this endpoint 200 with an empty list rather than failing, so the
@@ -827,7 +839,7 @@ class StatsManager:
                 if not isinstance(response, list) or not response:
                     logger.debug("Legacy IPS endpoint returned no events, trying v2 security logs")
                     try:
-                        response = await self._get_security_events_v2(start_time, end_time, limit)
+                        response, complete = await self._get_security_events_v2(start_time, end_time, limit)
                     except Exception as v2_error:
                         # Deliberately not raising, unlike the branch above: legacy did
                         # answer here, and a controller old enough to have no v2 endpoint
@@ -836,6 +848,8 @@ class StatsManager:
                         # rather than held as "no threats" for the whole TTL.
                         logger.debug("v2 security log fallback failed: %s", v2_error)
                         return []
+                    if not complete:
+                        return response
             result = response if isinstance(response, list) else []
             self._connection._update_cache(cache_key, result, timeout=300)
             return result
@@ -843,15 +857,25 @@ class StatsManager:
             logger.error("Error getting IPS events: %s", e)
             raise
 
-    async def _get_security_events_v2(self, start_time: int, end_time: int, limit: int) -> List[Dict[str, Any]]:
-        """Fallback for controllers where legacy IPS events no longer exist."""
+    async def _get_security_events_v2(
+        self, start_time: int, end_time: int, limit: int
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Fallback for controllers where legacy IPS events no longer exist.
+
+        Returns the events and whether the read was complete. It is incomplete when the
+        page bound stopped it before the log or the limit ran out; callers must not
+        cache that as the answer for the window.
+        """
         # Threat blocks are logged with show_on_dashboard=false, so the
         # dashboard-only /system-log/critical view never contains them; the
         # full log filtered to the SECURITY category does (verified on 10.6).
-        # That category also carries ordinary firewall blocks, so rows are
-        # narrowed to the intrusion-prevention subcategory before the limit is
-        # applied, reading further pages while firewall rows crowd them out.
+        # That category also carries ordinary firewall blocks, which can outnumber
+        # threats by hundreds to one. The controller filters on `subcategories`
+        # (the singular key is ignored), and rows are narrowed again here in case
+        # a controller ignores the filter, reading further pages if firewall rows
+        # still crowd threats out.
         events: List[Dict[str, Any]] = []
+        seen_ids: set[Any] = set()
         for page_number in range(_IPS_V2_MAX_PAGES):
             api_request = ApiRequestV2(
                 method="post",
@@ -860,15 +884,26 @@ class StatsManager:
                     "timestampFrom": start_time,
                     "timestampTo": end_time,
                     "categories": ["SECURITY"],
+                    "subcategories": [_IPS_SUBCATEGORY],
                     "pageNumber": page_number,
                     "pageSize": _IPS_V2_PAGE_SIZE,
                 },
             )
-            rows = _system_log_rows(await self._connection.request(api_request))
-            events.extend(row for row in rows if _is_ips_event(row))
-            if len(events) >= limit or len(rows) < _IPS_V2_PAGE_SIZE:
-                break
-        return events[:limit]
+            rows, page_size = _system_log_page(await self._connection.request(api_request))
+            for row in rows:
+                if not _is_ips_event(row):
+                    continue
+                # New events shift rows between page reads, so a row can repeat.
+                row_id = row.get("id")
+                if row_id is not None:
+                    if row_id in seen_ids:
+                        continue
+                    seen_ids.add(row_id)
+                events.append(row)
+            if len(events) >= limit or page_size < _IPS_V2_PAGE_SIZE:
+                return events[:limit], True
+        logger.warning("IPS events read stopped after %d pages; the result may be incomplete", _IPS_V2_MAX_PAGES)
+        return events[:limit], False
 
     async def get_client_sessions(
         self,

@@ -175,6 +175,19 @@ async def test_top_clients_explicit_window_never_falls_back(response: Any, bound
     manager._client_manager.get_clients.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_top_clients_live_counter_failure_is_translated() -> None:
+    """The fallback read must not carry controller text into the error, like the report path."""
+    manager, _ = _manager([])
+    manager._client_manager.get_clients = AsyncMock(side_effect=RuntimeError("controller detail aa:bb:cc:00:00:09"))
+
+    with pytest.raises(stats_module.RequestError) as excinfo:
+        await manager.get_top_clients()
+
+    assert str(excinfo.value) == "Top clients live counter read failed (RuntimeError)."
+    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+
+
 # --- top clients: automatic granularity ---------------------------------------------
 
 
@@ -402,6 +415,7 @@ async def test_ips_fallback_returns_only_intrusion_prevention_rows(envelope: str
     v2_request = connection.request.call_args_list[1][0][0]
     assert v2_request.path == "/system-log/all"
     assert v2_request.data["categories"] == ["SECURITY"]
+    assert v2_request.data["subcategories"] == ["SECURITY_INTRUSION_PREVENTION"]
 
 
 @pytest.mark.asyncio
@@ -427,6 +441,53 @@ async def test_ips_fallback_page_reads_are_bounded() -> None:
 
     assert await manager.get_ips_events(limit=5) == []
     assert connection.request.await_count == 1 + stats_module._IPS_V2_MAX_PAGES
+
+
+@pytest.mark.asyncio
+async def test_ips_fallback_stopped_by_page_bound_is_not_cached() -> None:
+    """Threats past the page bound are unread, so the partial answer must not stand for the window."""
+    firewall = {"category": "SECURITY", "subcategory": "SECURITY_FIREWALL"}
+    full_page = {"data": [firewall] * stats_module._IPS_V2_PAGE_SIZE}
+    manager, connection = _manager(cached=True)
+    connection.request.side_effect = ([[]] + [full_page] * stats_module._IPS_V2_MAX_PAGES) * 2
+
+    assert await manager.get_ips_events(limit=5) == []
+    assert await manager.get_ips_events(limit=5) == []
+    assert connection.request.await_count == 2 * (1 + stats_module._IPS_V2_MAX_PAGES)
+
+
+@pytest.mark.asyncio
+async def test_ips_fallback_complete_read_is_cached() -> None:
+    threat = {"category": "SECURITY", "subcategory": "SECURITY_INTRUSION_PREVENTION", "id": "t1"}
+    manager, connection = _manager(cached=True)
+    connection.request.side_effect = [[], {"data": [threat]}]
+
+    assert await manager.get_ips_events(limit=5) == [threat]
+    assert await manager.get_ips_events(limit=5) == [threat]
+    assert connection.request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ips_fallback_drops_rows_repeated_across_pages() -> None:
+    """A new event shifts rows between page reads, so the last row of one page can open the next."""
+    firewall = {"category": "SECURITY", "subcategory": "SECURITY_FIREWALL"}
+    threat = {"category": "SECURITY", "subcategory": "SECURITY_INTRUSION_PREVENTION", "id": "t1"}
+    full_page = {"data": [firewall] * (stats_module._IPS_V2_PAGE_SIZE - 1) + [threat]}
+    manager, connection = _manager()
+    connection.request.side_effect = [[], full_page, {"data": [threat]}]
+
+    assert await manager.get_ips_events(limit=5) == [threat]
+
+
+@pytest.mark.asyncio
+async def test_ips_fallback_junk_row_does_not_end_paging_early() -> None:
+    firewall = {"category": "SECURITY", "subcategory": "SECURITY_FIREWALL"}
+    threat = {"category": "SECURITY", "subcategory": "SECURITY_INTRUSION_PREVENTION", "id": "t2"}
+    page = {"data": [firewall] * (stats_module._IPS_V2_PAGE_SIZE - 1) + ["junk"]}
+    manager, connection = _manager()
+    connection.request.side_effect = [[], page, {"data": [threat]}]
+
+    assert await manager.get_ips_events(limit=5) == [threat]
 
 
 # --- window bound parsing -------------------------------------------------------------
